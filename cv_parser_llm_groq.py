@@ -1,0 +1,337 @@
+"""
+CV Parser LLM — Groq API
+======================================
+Approche : extraction structurée via un LLM (Mistral, Llama3, etc.) en utilisant la Groq API.
+
+Dépendances :
+    pip install groq pdfminer.six python-docx
+    # Installer Groq : https://console.groq.com
+    # Puis : groq pull mistral  (ou llama3, gemma2, etc.)
+"""
+
+import json
+import re
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional, Any
+
+import ollama
+from pdfminer.high_level import extract_text as pdf_extract_text
+from docx import Document
+
+
+# ---------------------------------------------------------------------------
+# Data Model (identique à la version classique pour compatibilité ATS)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CVData:
+    full_name:      Optional[str]  = None
+    email:          Optional[str]  = None
+    phone:          Optional[str]  = None
+    location:       Optional[str]  = None
+    linkedin:       Optional[str]  = None
+    github:         Optional[str]  = None
+    summary:        Optional[str]  = None
+    skills:         list[str]      = field(default_factory=list)
+    languages:      list[str]      = field(default_factory=list)
+    experiences:    list[dict]     = field(default_factory=list)
+    education:      list[dict]     = field(default_factory=list)
+    certifications: list[str]      = field(default_factory=list)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False, indent=indent)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CVData":
+        return cls(
+            full_name      = data.get("full_name"),
+            email          = data.get("email"),
+            phone          = data.get("phone"),
+            location       = data.get("location"),
+            linkedin       = data.get("linkedin"),
+            github         = data.get("github"),
+            summary        = data.get("summary"),
+            skills         = data.get("skills", []),
+            languages      = data.get("languages", []),
+            experiences    = data.get("experiences", []),
+            education      = data.get("education", []),
+            certifications = data.get("certifications", []),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Text Extractor (réutilisable)
+# ---------------------------------------------------------------------------
+
+class TextExtractor:
+    """Extrait le texte brut depuis PDF, DOCX ou TXT."""
+
+    @staticmethod
+    def extract(file_path: str) -> str:
+        path = Path(file_path)
+        suffix = path.suffix.lower()
+
+        if suffix == ".pdf":
+            return pdf_extract_text(file_path) or ""
+        elif suffix == ".docx":
+            doc = Document(file_path)
+            return "\n".join(p.text for p in doc.paragraphs)
+        elif suffix in (".txt", ".md"):
+            return path.read_text(encoding="utf-8")
+        else:
+            raise ValueError(f"Format non supporté : {suffix}")
+
+
+# ---------------------------------------------------------------------------
+# Prompt Builder
+# ---------------------------------------------------------------------------
+
+class CVPromptBuilder:
+    """
+    Construit un prompt structuré pour l'extraction du CV.
+    On utilise le JSON Schema directement dans le prompt pour guider
+    la réponse du LLM (structured output prompting).
+    """
+
+    # Schéma JSON cible explicite dans le prompt
+    JSON_SCHEMA = """
+{
+  "full_name":      "string | null",
+  "email":          "string | null",
+  "phone":          "string | null",
+  "location":       "string | null",
+  "linkedin":       "string | null",
+  "github":         "string | null",
+  "summary":        "string | null  (2-3 phrases max)",
+  "skills":         ["string", "..."],
+  "languages":      [{"language": "string", "level": "string"}, "..."],
+  "experiences": [
+    {
+      "title":       "string",
+      "company":     "string",
+      "location":    "string | null",
+      "period":      "string  (ex: Jan 2022 - Présent)",
+      "description": "string  (missions clés, bullet points)"
+    }
+  ],
+  "education": [
+    {
+      "degree":      "string",
+      "institution": "string",
+      "location":    "string | null",
+      "period":      "string"
+    }
+  ],
+  "certifications": ["string", "..."]
+}
+"""
+
+    def build(self, cv_text: str) -> str:
+        # On tronque le CV si trop long (évite de dépasser la context window)
+        truncated = cv_text[:6000] if len(cv_text) > 6000 else cv_text
+
+        return f"""Tu es un expert en analyse de CV et recrutement.
+
+Analyse le CV ci-dessous et extrais TOUTES les informations en respectant EXACTEMENT le schéma JSON fourni.
+
+RÈGLES IMPORTANTES :
+- Réponds UNIQUEMENT avec du JSON valide, sans markdown, sans explication.
+- Si une information est absente, utilise `null` pour les champs scalaires et `[]` pour les tableaux.
+- Ne complète pas, n'invente pas d'informations manquantes.
+- Normalise les dates au format "MMM YYYY" si possible.
+- Pour les compétences, liste uniquement les compétences techniques explicitement mentionnées.
+
+SCHÉMA JSON ATTENDU :
+{self.JSON_SCHEMA}
+
+CV À ANALYSER :
+---
+{truncated}
+---
+
+JSON :"""
+
+
+# ---------------------------------------------------------------------------
+# JSON Response Parser
+# ---------------------------------------------------------------------------
+
+class JSONResponseParser:
+    """Extrait et valide le JSON de la réponse LLM."""
+
+    @staticmethod
+    def parse(raw_response: str) -> dict[str, Any]:
+        # Nettoie le markdown si le LLM l'a quand même ajouté
+        cleaned = re.sub(r"```(?:json)?", "", raw_response).replace("```", "").strip()
+
+        # Tente d'extraire le JSON depuis la première accolade
+        json_start = cleaned.find("{")
+        json_end   = cleaned.rfind("}") + 1
+
+        if json_start == -1 or json_end == 0:
+            raise ValueError(f"Aucun JSON trouvé dans la réponse : {raw_response[:200]}")
+
+        json_str = cleaned[json_start:json_end]
+
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"JSON invalide : {e}\nContenu : {json_str[:300]}")
+
+
+# ---------------------------------------------------------------------------
+# Groq LLM Client
+# ---------------------------------------------------------------------------
+
+from groq import Groq
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+class GroqClient:
+
+    def __init__(self, model: str = "llama3-8b-8192", temperature: float = 0.0):
+        api_key = os.getenv("GROQ_API_KEY")
+
+        if not api_key:
+            raise ValueError("Définir GROQ_API_KEY dans le fichier .env")
+
+        self.client = Groq(api_key=api_key)
+        self.model = model
+        self.temperature = temperature
+
+    def generate(self, prompt: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+        )
+        return response.choices[0].message.content
+
+# ---------------------------------------------------------------------------
+# LLM CV Parser — Pipeline Principal
+# ---------------------------------------------------------------------------
+
+class LLMCVParser:
+    """
+    Parser CV basé sur LLM (Ollama).
+    
+    Stratégie en deux passes :
+    1. Extraction principale par LLM (informations sémantiques complexes)
+    2. Post-processing Regex pour garantir email/phone/URL (haute précision)
+    """
+
+    # Patterns de fallback pour les champs critiques
+    _EMAIL_PATTERN   = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+    _PHONE_PATTERN   = re.compile(r"(?:\+?\d{1,3}[\s\-.]?)?(?:\(?\d{2,4}\)?[\s\-.]?){2,4}\d{2,4}")
+    _LINKEDIN_PATTERN = re.compile(r"linkedin\.com/in/[\w\-]+")
+    _GITHUB_PATTERN  = re.compile(r"github\.com/[\w\-]+")
+
+    def __init__(self, model: str = "llama3-8b-8192", temperature: float = 0.0):
+        self.llm_client = GroqClient(model=model, temperature=temperature)
+        self.prompt_builder = CVPromptBuilder()
+        self.json_parser = JSONResponseParser()
+
+    def parse(self, file_path: str) -> CVData:
+        # 1. Extraction du texte brut
+        raw_text = TextExtractor.extract(file_path)
+
+        # 2. Construction du prompt et appel LLM
+        prompt      = self.prompt_builder.build(raw_text)
+        raw_response = self.llm_client.generate(prompt)
+
+        # 3. Parsing de la réponse JSON
+        extracted_data = self.json_parser.parse(raw_response)
+
+        # 4. Post-processing : fallback Regex pour les champs critiques
+        extracted_data = self._apply_regex_fallback(extracted_data, raw_text)
+
+        # 5. Validation et nettoyage
+        extracted_data = self._clean_data(extracted_data)
+
+        return CVData.from_dict(extracted_data)
+
+    def _apply_regex_fallback(self, data: dict, raw_text: str) -> dict:
+        """
+        Si le LLM rate un champ critique (email, phone, etc.),
+        on utilise Regex comme filet de sécurité.
+        """
+        if not data.get("email"):
+            m = self._EMAIL_PATTERN.search(raw_text)
+            data["email"] = m.group(0) if m else None
+
+        if not data.get("phone"):
+            m = self._PHONE_PATTERN.search(raw_text)
+            data["phone"] = m.group(0).strip() if m else None
+
+        if not data.get("linkedin"):
+            m = self._LINKEDIN_PATTERN.search(raw_text)
+            data["linkedin"] = m.group(0) if m else None
+
+        if not data.get("github"):
+            m = self._GITHUB_PATTERN.search(raw_text)
+            data["github"] = m.group(0) if m else None
+
+        return data
+
+    def _clean_data(self, data: dict) -> dict:
+        """Normalise et nettoie les données extraites."""
+        # Assure que les listes sont bien des listes
+        for list_field in ["skills", "languages", "experiences", "education", "certifications"]:
+            if not isinstance(data.get(list_field), list):
+                data[list_field] = []
+
+        # Nettoie les strings vides
+        for str_field in ["full_name", "email", "phone", "location", "linkedin", "github", "summary"]:
+            val = data.get(str_field)
+            if isinstance(val, str) and not val.strip():
+                data[str_field] = None
+
+        # Déduplique les skills
+        if data.get("skills"):
+            data["skills"] = sorted(set(s.lower().strip() for s in data["skills"] if s))
+
+        return data
+
+
+# ---------------------------------------------------------------------------
+# Factory : choisir le bon modèle selon les ressources disponibles
+# ---------------------------------------------------------------------------
+
+class CVParserFactory:
+
+    MODELS_BY_PRIORITY = [
+        "openai/gpt-oss-120b",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3-32b"
+    ]
+
+    @classmethod
+    def create(cls, preferred_model: Optional[str] = None) -> LLMCVParser:
+        model = preferred_model if preferred_model else cls.MODELS_BY_PRIORITY[1]
+        print(f"[CVParserFactory] Modèle Groq sélectionné : {model}")
+        return LLMCVParser(model=model)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    import os
+
+    if len(sys.argv) < 2:
+        print("Usage: python cv_parser_llm_groq.py <chemin_du_cv> [modele]")
+        print("Note: GROQ_API_KEY doit être définie en variable d'environnement ou dans .env")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    model_name = sys.argv[2] if len(sys.argv) > 2 else None
+
+    parser = CVParserFactory.create(preferred_model=model_name)
+    result = parser.parse(file_path)
+
+    print(result.to_json())
